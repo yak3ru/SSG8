@@ -1,0 +1,1 @@
+These files are preserved pre-v0.9.0 GUI integration tests from the former four-module application. They were archived because those pages are no longer present in the focused Application Protection edition. The active GUI tests are in tests/integration/test_application_only_ui.py.

@@ -1,0 +1,8 @@
+# SSG8 - Python dependencies
+#
+# Install into the project virtual environment:
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# PySide6 provides the native Windows desktop interface (Qt 6 bindings).
+
+PySide6>=6.8,<7.0

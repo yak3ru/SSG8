@@ -1,0 +1,427 @@
+"""Main window: sidebar, header, page stack and status chrome."""
+
+from __future__ import annotations
+
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer
+from PySide6.QtWidgets import (
+    QFrame,
+    QGraphicsOpacityEffect,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from ssg8.core.context import AppContext, build_context
+from ssg8.platform.windows.titlebar import apply_dark_title_bar
+from ssg8.ui import theme
+from ssg8.ui.components.action_button import ActionButton
+from ssg8.ui.components.icons import make_app_icon, make_pixmap
+from ssg8.ui.components.sidebar import Sidebar
+from ssg8.ui.components.top_header import TopHeader
+from ssg8.ui.navigation import DEFAULT_PAGE, ENTRIES_BY_ID, section_for, title_for
+from ssg8.ui.pages import PAGE_CLASSES
+from ssg8.ui.pages import create_page
+from ssg8.ui.pages.base_page import BasePage
+from ssg8.services.paranoia.states import ParanoiaState
+from ssg8.services.autonomous import AutonomousController
+from ssg8.services.window_observer import WindowObserver, windows_snapshot
+from ssg8.services.approved_window_closer import request_normal_close, window_still_open
+from ssg8.ui.finale import SelfQuarantineDialog
+
+WINDOW_TITLE = "SSG8 \u2014 Security Control Center"
+MINIMUM_WIDTH = 1000
+MINIMUM_HEIGHT = 650
+DEFAULT_WIDTH = 1220
+DEFAULT_HEIGHT = 740
+FOOTER_HEIGHT = 34
+STRIP_HEIGHT = 38
+FADE_DURATION_MS = 150
+
+
+
+
+class MainWindow(QMainWindow):
+    """The application shell that hosts every page."""
+
+    def __init__(self, context: AppContext | None = None, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.context = context or build_context()
+        self._pages: dict[str, BasePage] = {}
+        self._current_page_id = ""
+        self._fade_animation: QPropertyAnimation | None = None
+        self._fade_page: BasePage | None = None
+        self._centred = False
+        self.autonomy = AutonomousController(
+            self.context.protection, self.context.paranoia, self.context.state, self
+        )
+        self._finale = None
+        self.window_observer = WindowObserver(self)
+        self._close_requests: set[tuple[int, int]] = set()
+
+
+        self.setWindowTitle(WINDOW_TITLE)
+        self.setMinimumSize(MINIMUM_WIDTH, MINIMUM_HEIGHT)
+        self.resize(DEFAULT_WIDTH, DEFAULT_HEIGHT)
+        self.setWindowIcon(make_app_icon())
+
+        self._build_ui()
+        self._build_pages()
+        self._connect_signals()
+        self._on_lockdown_changed(self.context.state.lockdown_active())
+        self._on_paranoia_state_changed(
+            ParanoiaState.NORMAL, self.context.paranoia.state()
+        )
+
+        self.navigate(DEFAULT_PAGE, record=False)
+
+    # --- construction ------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        root = QWidget(self)
+        root.setObjectName("Root")
+        root.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setCentralWidget(root)
+
+        layout = QHBoxLayout(root)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.sidebar = Sidebar(root)
+        layout.addWidget(self.sidebar)
+
+        right = QWidget(root)
+        right.setObjectName("MainColumn")
+        column = QVBoxLayout(right)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+
+        self.header = TopHeader(self.context.events, right)
+        column.addWidget(self.header)
+
+        self._lockdown_strip = self._build_lockdown_strip(right)
+        self._lockdown_strip.hide()  # Internal compatibility; never displayed.
+
+        self.stack = QStackedWidget(right)
+        column.addWidget(self.stack, 1)
+
+        column.addWidget(self._build_footer(right))
+        layout.addWidget(right, 1)
+
+    def _build_lockdown_strip(self, parent: QWidget) -> QFrame:
+        strip = QFrame(parent)
+        strip.setObjectName("LockdownStrip")
+        strip.setFixedHeight(STRIP_HEIGHT)
+        strip.setVisible(False)
+
+        row = QHBoxLayout(strip)
+        row.setContentsMargins(28, 0, 16, 0)
+        row.setSpacing(10)
+
+        icon = QLabel(strip)
+        icon.setPixmap(make_pixmap("alert", theme.tone("danger").text, 15))
+        row.addWidget(icon, 0)
+
+        text = QLabel(
+            "SIMULATED LOCKDOWN ACTIVE \u2014 Windows, input devices and system settings "
+            "are not affected.",
+            strip,
+        )
+        text.setObjectName("LockdownStripText")
+        row.addWidget(text, 1)
+
+        self._strip_button = ActionButton("Open Lockdown Center", "ghost", parent=strip)
+        self._strip_button.clicked.connect(lambda: self.navigate("lockdown"))
+        row.addWidget(self._strip_button, 0)
+        return strip
+
+    def _build_footer(self, parent: QWidget) -> QFrame:
+        footer = QFrame(parent)
+        footer.setObjectName("AppFooter")
+        footer.setFixedHeight(FOOTER_HEIGHT)
+
+        row = QHBoxLayout(footer)
+        row.setContentsMargins(28, 0, 18, 0)
+        row.setSpacing(10)
+
+        note = QLabel(
+            "Protection requests normal app window closes; SSG8, VS Code and recovery controls stay available.",
+            footer,
+        )
+        note.setObjectName("FooterNote")
+        row.addWidget(note)
+        row.addStretch(1)
+
+        build = QLabel("SSG8 App Protection | CyberLarps", footer)
+        build.setObjectName("FooterBuild")
+        row.addWidget(build)
+        return footer
+
+    def _build_pages(self) -> None:
+        for page_id in PAGE_CLASSES:
+            page = create_page(page_id, self.context, self.stack)
+            page.navigate_requested.connect(self.navigate)
+            page.ensure_built()
+            self._pages[page_id] = page
+            self.stack.addWidget(page)
+
+    def _connect_signals(self) -> None:
+        self.sidebar.navigate_requested.connect(self.navigate)
+        self.header.settings_requested.connect(lambda: self.navigate("recovery"))
+        self.header.logs_requested.connect(lambda: self.navigate("logs"))
+        self.context.state.lockdown_changed.connect(self._on_lockdown_changed)
+        self.context.paranoia.state_changed.connect(self._on_paranoia_state_changed)
+        self.autonomy.finale_requested.connect(self._show_finale)
+        self.context.protection.modules_changed.connect(self._sync_window_observer)
+        self.window_observer.opened.connect(self._on_window_opened)
+        self._alerts = []
+        self._alert_position_index = 0
+        self._sync_window_observer()
+        self.context.protection.modules_changed.connect(
+            lambda: self._on_paranoia_state_changed(self.context.paranoia.state(), self.context.paranoia.state())
+        )
+
+    # --- navigation --------------------------------------------------------
+
+    def navigate(self, page_id: str, record: bool = True) -> bool:
+        """Switch to ``page_id``. Returns ``True`` when the page changed."""
+        page = self._pages.get(page_id)
+        if page is None or page_id not in ENTRIES_BY_ID or page_id == self._current_page_id:
+            return False
+
+        previous = self._current_page_id
+        self._current_page_id = page_id
+
+        self.stack.setCurrentWidget(page)
+        self.sidebar.set_active(page_id)
+        self.header.set_page(title_for(page_id), section_for(page_id))
+        page.on_shown()
+
+        if record and previous and self.context.preferences.get("record_navigation"):
+            self.context.events.record(
+                _navigation_category(),
+                _navigation_severity(),
+                f"Opened {title_for(page_id)}",
+            )
+
+        self._fade_in(page)
+        if record and previous:
+            self.autonomy.record_navigation(page_id)
+        return True
+
+    @property
+    def current_page_id(self) -> str:
+        return self._current_page_id
+
+    def page(self, page_id: str) -> BasePage | None:
+        return self._pages.get(page_id)
+
+    def pages(self) -> dict[str, BasePage]:
+        return dict(self._pages)
+
+    def _fade_in(self, page: BasePage) -> None:
+        """Briefly fade a page in so navigation feels deliberate."""
+        if self._fade_animation is not None:
+            self._fade_animation.stop()
+            if self._fade_page is not None and self._fade_page is not page:
+                self._fade_page.setGraphicsEffect(None)
+
+        effect = QGraphicsOpacityEffect(page)
+        page.setGraphicsEffect(effect)
+
+        animation = QPropertyAnimation(effect, b"opacity", self)
+        animation.setDuration(FADE_DURATION_MS)
+        animation.setStartValue(0.35)
+        animation.setEndValue(1.0)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        def _finish() -> None:
+            page.setGraphicsEffect(None)
+            if self._fade_animation is animation:
+                self._fade_animation = None
+                self._fade_page = None
+            animation.deleteLater()
+
+        animation.finished.connect(_finish)
+        animation.start()
+        self._fade_animation = animation
+        self._fade_page = page
+
+    # --- application state -------------------------------------------------
+
+    def _on_lockdown_changed(self, active: bool) -> None:
+        self.sidebar.set_lockdown_state(self.context.protection.is_module_enabled("application"))
+        self._lockdown_strip.setVisible(False)
+
+        self._on_paranoia_state_changed(
+            ParanoiaState.NORMAL, self.context.paranoia.state()
+        )
+
+    def _on_paranoia_state_changed(
+        self, _previous: ParanoiaState, state: ParanoiaState
+    ) -> None:
+        """Keep the header badge in step with the paranoia progression."""
+        # Internal state progression is intentionally not advertised in the UI.
+        if state in (ParanoiaState.SELF_AUDIT, ParanoiaState.SELF_THREAT_DETECTED):
+            label, tone = "SECURITY AUDIT", "warning"
+        elif self.context.protection.enabled_module_count():
+            label, tone = "PROTECTION ACTIVE", "success"
+        else:
+            label, tone = "APPLICATION ONLINE", "success"
+        self.header.status_badge.set_text(label)
+        self.header.status_badge.set_tone(tone)
+
+    def _sync_window_observer(self) -> None:
+        """Activate monitoring and check windows open before the switch."""
+        active = self.context.protection.is_module_enabled("application")
+        freshly_enabled = active and not self.window_observer.enabled()
+        self.window_observer.set_enabled(active)
+        self.sidebar.set_lockdown_state(active)
+        if not active:
+            self._close_requests.clear()
+
+        elif freshly_enabled:
+            # The observer establishes a baseline; this additional pass handles
+            # windows that were already open when protection was enabled.
+            for window in windows_snapshot():
+                self._on_window_opened(window)
+
+    def _on_window_opened(self, window) -> None:
+        """Request a normal close for eligible app windows; no risk score."""
+        if not self.context.protection.is_module_enabled("application"):
+            return
+        key = (window.handle, window.process_id)
+
+        if key in self._close_requests:
+            return
+        if not request_normal_close(window):
+            return
+        self._close_requests.add(key)
+        QTimer.singleShot(400, lambda w=window: self._check_close_request(w))
+
+    def _check_close_request(self, window) -> None:
+        key = (window.handle, window.process_id)
+        if not self.context.protection.is_module_enabled("application"):
+            self._close_requests.discard(key)
+            return
+        closed = not window_still_open(window)
+        self._show_close_result(window.executable, closed)
+        # Do not repeatedly hammer an unresponsive app or its save prompt.
+
+    def _show_close_result(self, name: str, closed: bool) -> None:
+        """Show one warning per close attempt, rotating its desktop position.
+
+        Alerts are separate nonmodal windows, so they can appear even if the
+        SSG8 dashboard is minimized. Keep a small, bounded number visible;
+        new alerts replace the oldest rather than flooding the entire desktop.
+        This method never changes Application Protection or process handling.
+        """
+        from PySide6.QtGui import QCursor
+        from PySide6.QtWidgets import QApplication
+
+        from ssg8.ui.components.security_notification import SecurityNotification
+
+        # Always show the newest event. Avoid a flood of alert windows.
+        if len(self._alerts) >= 3:
+            oldest = self._alerts[0]
+            oldest.close()
+            if oldest in self._alerts:
+                self._dismiss_alert(oldest)
+
+        box = SecurityNotification(name, closed)
+
+        self._alerts.append(box)
+        box.finished.connect(lambda _result, msg=box: self._dismiss_alert(msg))
+        box.show()
+
+        # Each new event appears in a different region of the current desktop.
+        # Fractions are within usable screen space, so alerts avoid the taskbar.
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            width = box.frameGeometry().width()
+            height = box.frameGeometry().height()
+            x_room = max(0, area.width() - width)
+            y_room = max(0, area.height() - height)
+            positions = (
+                (0.08, 0.10),   # upper left
+                (0.88, 0.16),   # upper right
+                (0.42, 0.83),   # lower center
+                (0.10, 0.74),   # lower left
+                (0.83, 0.73),   # lower right
+                (0.48, 0.34),   # center
+            )
+            position = positions[self._alert_position_index % len(positions)]
+            self._alert_position_index += 1
+            box.move(
+                area.left() + round(x_room * position[0]),
+                area.top() + round(y_room * position[1]),
+            )
+        box.raise_()
+
+    def _dismiss_alert(self, alert) -> None:
+        if alert in self._alerts:
+            self._alerts.remove(alert)
+        alert.deleteLater()
+
+    def _show_finale(self, report) -> None:
+        """Show an animated, non-destructive ending, then safely exit."""
+        if self._finale is not None:
+            return
+        self._finale = SelfQuarantineDialog(report, self)
+        self._finale.finished_sequence.connect(self._complete_finale)
+        self._finale.replay_requested.connect(self._replay)
+        self._finale.show()
+
+    def _complete_finale(self) -> None:
+        self.window_observer.stop()
+        self.context.paranoia.begin_quarantine()
+        self.context.paranoia.complete_recovery()
+        self.autonomy.prepare_shutdown()
+        self.close()
+
+    def _replay(self) -> None:
+        if self._finale is not None:
+            self._finale.close()
+            self._finale = None
+        self.autonomy.reset()
+        self.navigate("dashboard", record=False)
+
+    # --- Qt overrides ------------------------------------------------------
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        """Stop optional observation and remove the demo's own temporary files."""
+        try:
+            if self.context.monitor.enabled():
+                self.context.monitor.stop()
+            self.autonomy.prepare_shutdown()
+            self.window_observer.stop()
+            self.context.demo.cleanup()
+        except Exception:  # noqa: BLE001 - closing must always succeed
+            pass
+        super().closeEvent(event)
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().showEvent(event)
+        apply_dark_title_bar(self)
+        if not self._centred:
+            self._centred = True
+            screen = self.screen()
+            if screen is not None:
+                frame = self.frameGeometry()
+                frame.moveCenter(screen.availableGeometry().center())
+                self.move(frame.topLeft())
+
+
+def _navigation_category():
+    from ssg8.core.models import EventCategory
+
+    return EventCategory.NAVIGATION
+
+
+def _navigation_severity():
+    from ssg8.core.models import Severity
+
+    return Severity.INFO

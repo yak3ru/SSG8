@@ -1,0 +1,181 @@
+"""End-to-end Phase 5 workflow and responsive UI checks."""
+
+from __future__ import annotations
+
+import pytest
+from PySide6.QtWidgets import QApplication
+
+from ssg8.core.context import build_context
+from ssg8.core.models import EventCategory
+from ssg8.security.analysis.models import AlertStatus, IncidentStatus
+from ssg8.storage.preferences import Preferences
+from ssg8.storage.protection_store import ProtectionStore
+from ssg8.ui import theme
+from ssg8.ui.main_window import MainWindow
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    app = QApplication.instance() or QApplication([])
+    theme.apply_theme(app)
+    return app
+
+
+@pytest.fixture
+def window(qapp, tmp_path):
+    context = build_context(
+        Preferences(tmp_path / "preferences.json"),
+        ProtectionStore(tmp_path / "data"),
+    )
+    main = MainWindow(context)
+    main.show()
+    qapp.processEvents()
+    yield main
+    main.close()
+    qapp.processEvents()
+
+
+def trigger_website(window: MainWindow, count: int = 3) -> None:
+    window.context.protection.add_website_rule("bad.test", "block")
+    for _ in range(count):
+        window.context.protection.evaluate_website("https://bad.test/login")
+
+
+def test_empty_threat_dashboard_and_incidents(window) -> None:
+    window.navigate("threat-monitor")
+    QApplication.processEvents()
+    page = window.page("threat-monitor")
+    assert page.visible_findings() == 0
+    assert page.visible_alerts() == 0
+    assert page.visible_incidents() == 0
+    assert page._trend_empty.isVisible()
+
+    window.navigate("incidents")
+    QApplication.processEvents()
+    incidents = window.page("incidents")
+    assert incidents.visible_incidents() == 0
+    assert incidents.detail_title() == ""
+
+
+def test_complete_analysis_alert_and_incident_workflow(window) -> None:
+    trigger_website(window)
+    analysis = window.context.analysis
+
+    findings = analysis.findings()
+    alerts = analysis.alerts()
+    incidents = analysis.incidents()
+    assert len(findings) == 1
+    assert len(alerts) == 1
+    assert len(incidents) == 1
+    assert alerts[0].status is AlertStatus.NEW
+    assert incidents[0].status is IncidentStatus.OPEN
+
+    window.navigate("threat-monitor")
+    QApplication.processEvents()
+    page = window.page("threat-monitor")
+    assert page.visible_findings() == 1
+    assert page.visible_alerts() == 1
+    assert page.visible_incidents() == 1
+    assert page.select_alert(alerts[0].id)
+    assert alerts[0].id in page.alert_detail_text()
+    assert "Score" in page.alert_detail_text() or "/100" in page.alert_detail_text()
+
+    page._acknowledge_selected()
+    QApplication.processEvents()
+    assert analysis.alert(alerts[0].id).status is AlertStatus.ACKNOWLEDGED
+
+    window.navigate("incidents")
+    QApplication.processEvents()
+    page = window.page("incidents")
+    assert page.visible_incidents() == 1
+    assert page.selected_incident_id() == incidents[0].id
+    assert incidents[0].id in page.detail_title() or page.detail_title()
+
+    page._start_investigation()
+    QApplication.processEvents()
+    assert analysis.incident(incidents[0].id).status is IncidentStatus.INVESTIGATING
+
+    assert analysis.add_incident_note(incidents[0].id, "Reviewed the internal pattern.")
+    QApplication.processEvents()
+    assert analysis.incident(incidents[0].id).notes
+
+    assert analysis.resolve_incident(incidents[0].id)
+    assert analysis.incident(incidents[0].id).status is IncidentStatus.RESOLVED
+    QApplication.processEvents()
+    assert window.page("incidents").detail_title()
+
+
+def test_threat_analysis_is_logged_and_filterable(window) -> None:
+    trigger_website(window)
+    events = window.context.events.entries()
+
+    assert any(entry.category is EventCategory.ANALYSIS for entry in events)
+    assert any(entry.category is EventCategory.ALERT for entry in events)
+    assert any(entry.category is EventCategory.INCIDENT for entry in events)
+    assert any(entry.category is EventCategory.PROTECTION for entry in events)
+
+    window.navigate("logs")
+    QApplication.processEvents()
+    page = window.page("logs")
+    assert page.visible_events() >= 4
+    assert page.visible_decisions() >= 3
+
+
+def test_persistence_after_restart(window) -> None:
+    trigger_website(window)
+    analysis = window.context.analysis
+    alert = analysis.alerts()[0]
+    incident = analysis.incidents()[0]
+    finding = analysis.findings()[0]
+
+    assert analysis.acknowledge_alert(alert.id)
+    assert analysis.start_investigation(incident.id)
+    assert analysis.add_incident_note(incident.id, "Persistence check")
+    assert analysis.resolve_incident(incident.id)
+
+    root = analysis.store.root
+    preferences_path = window.context.preferences.path
+    reloaded = build_context(
+        Preferences(preferences_path),
+        ProtectionStore(root),
+    )
+    restored_analysis = reloaded.analysis
+
+    assert restored_analysis.finding(finding.id) is not None
+    assert restored_analysis.alert(alert.id).status is AlertStatus.ACKNOWLEDGED
+    restored_incident = restored_analysis.incident(incident.id)
+    assert restored_incident is not None
+    assert restored_incident.status is IncidentStatus.RESOLVED
+    assert restored_incident.notes[0].text == "Persistence check"
+    assert restored_analysis.analyze_now() == ()
+
+
+def test_cross_module_analysis_raises_high_risk(window) -> None:
+    protection = window.context.protection
+    protection.add_website_rule("bad.test", "block")
+    protection.add_application_rule("Tool", "", "block")
+    for _ in range(3):
+        protection.evaluate_website("https://bad.test/")
+        protection.evaluate_application("Tool")
+
+    analysis = window.context.analysis
+    findings = analysis.findings()
+    assert any(len(finding.module_ids) > 1 for finding in findings)
+    overview = analysis.risk_overview()
+    assert overview["score"] >= 50
+    assert overview["level"].value in ("HIGH", "CRITICAL")
+    assert overview["active_incidents"] >= 1
+
+
+@pytest.mark.parametrize("size", [(1000, 650), (1600, 900)])
+def test_upgraded_pages_fit_window(window, size) -> None:
+    window.resize(*size)
+    QApplication.processEvents()
+    trigger_website(window)
+
+    for page_id in ("threat-monitor", "incidents", "logs"):
+        window.navigate(page_id)
+        QApplication.processEvents()
+        page = window.page(page_id)
+        content = page._scroll.widget()
+        assert content.width() <= page._scroll.viewport().width() + 1, page_id

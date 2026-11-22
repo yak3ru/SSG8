@@ -1,0 +1,153 @@
+"""SSG8 single-process Windows system-tray mode.
+
+Closing the dashboard hides it without disabling Application Protection or
+stopping the existing window observer. The tray offers an immediate Pause
+and a normal Quit path. Background external-window close requests are limited
+by MainWindow._on_window_opened (see the accompanying guard patch).
+"""
+
+from __future__ import annotations
+
+from PySide6.QtCore import QEvent, QObject, QTimer
+from PySide6.QtWidgets import QMenu, QSystemTrayIcon
+
+from ssg8.ui.components.icons import make_app_icon
+
+
+class TrayMode(QObject):
+    """Keep the existing SSG8 process running when the dashboard is hidden."""
+
+    def __init__(self, app, window) -> None:
+        super().__init__(app)
+        self.app = app
+        self.window = window
+        self._quitting = False
+        self._first_hide = True
+        self.tray: QSystemTrayIcon | None = None
+
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        self.app.setQuitOnLastWindowClosed(False)
+
+        # Only one tray icon; no additional process or window is created.
+        self.tray = QSystemTrayIcon(make_app_icon(), self)
+        self.tray.setToolTip("SSG8 — Running in this Windows session")
+
+        self.menu = QMenu()
+        self.open_action = self.menu.addAction("Open SSG8")
+        self.open_action.triggered.connect(self.restore)
+
+        self.pause_action = self.menu.addAction("Pause Application Protection")
+        self.pause_action.triggered.connect(self.pause_protection)
+
+        self.menu.addSeparator()
+        self.status_action = self.menu.addAction("Application Protection: OFF")
+        self.status_action.setEnabled(False)
+
+        self.menu.addSeparator()
+        self.quit_action = self.menu.addAction("Quit SSG8")
+        self.quit_action.triggered.connect(self.quit)
+
+        self.tray.setContextMenu(self.menu)
+        self.tray.activated.connect(self._on_tray_clicked)
+        self.window.context.protection.modules_changed.connect(self._refresh_status)
+        self.window.installEventFilter(self)
+        self.app.aboutToQuit.connect(self._on_app_quit)
+        self._refresh_status()
+        self.tray.show()
+
+    def eventFilter(self, watched, event):  # noqa: N802 - Qt override
+        if watched is self.window and event.type() == QEvent.Type.Close:
+            if self._quitting:
+                return False
+
+            # Leave the self-audit finale's intentional shutdown intact.
+            if getattr(self.window, "_finale", None) is not None:
+                self._quitting = True
+                self.pause_protection()
+                if self.tray is not None:
+                    self.tray.hide()
+                QTimer.singleShot(0, self.app.quit)
+                return False
+
+            if self.tray is not None and self.tray.isVisible():
+                # Keep the observer and selected protection state unchanged.
+                # MainWindow controls which windows may be closed in background.
+                event.ignore()
+                self.window.hide()
+                self._refresh_status()
+                if self._first_hide and self.tray.supportsMessages():
+                    self._first_hide = False
+                    self.tray.showMessage(
+                        "SSG8 is still running",
+                        "SSG8 remains active in the tray. Use Pause or Quit "
+                        "from the tray menu whenever you want to stop it.",
+                        QSystemTrayIcon.MessageIcon.Information,
+                        4500,
+                    )
+                return True
+
+        return super().eventFilter(watched, event)
+
+    def _on_tray_clicked(self, reason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.restore()
+
+    def restore(self) -> None:
+        """Show the same dashboard; the observer was never stopped."""
+        if self._quitting:
+            return
+        if self.window.isMinimized():
+            self.window.showNormal()
+        else:
+            self.window.show()
+        self.window.raise_()
+        self.window.activateWindow()
+        self._refresh_status()
+
+    def pause_protection(self) -> None:
+        """Explicitly disable Application Protection from the tray."""
+        protection = self.window.context.protection
+        if protection.is_module_enabled("application"):
+            protection.set_module_enabled("application", False)
+        # MainWindow's modules_changed handler stops its observer.
+        self._refresh_status()
+
+    def _refresh_status(self) -> None:
+        if self.tray is None:
+            return
+        enabled = self.window.context.protection.is_module_enabled("application")
+        if enabled and self.window.isHidden():
+            status = "Application Protection: ON (background)"
+        else:
+            status = "Application Protection: ON" if enabled else "Application Protection: OFF"
+        self.status_action.setText(status)
+        self.pause_action.setEnabled(enabled)
+        self.tray.setToolTip(
+            "SSG8 — Background session" if self.window.isHidden()
+            else "SSG8 — Running in this Windows session"
+        )
+
+    def quit(self) -> None:
+        """Stop protection and exit through MainWindow's cleanup hooks."""
+        if self._quitting:
+            return
+        self.pause_protection()
+        self._quitting = True
+        if self.tray is not None:
+            self.tray.hide()
+        self.window.close()
+        self.app.quit()
+
+    def _on_app_quit(self) -> None:
+        """Release the tray on a normal Qt/Windows shutdown."""
+        if self._quitting:
+            return
+        self._quitting = True
+        if self.tray is not None:
+            self.tray.hide()
+        self.window.close()

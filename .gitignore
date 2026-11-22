@@ -1,0 +1,64 @@
+# ---------------------------------------------------------------------------
+# SSG8 - Git ignore rules
+#
+# Only generated, local and machine specific artefacts are ignored.
+# Source code, requirements.txt, documentation and project configuration
+# (.github/, .vscode/) stay tracked.
+# ---------------------------------------------------------------------------
+
+# --- Python virtual environment ---
+.venv/
+venv/
+env/
+
+# --- Python bytecode and caches ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.egg-info/
+.eggs/
+
+# --- Test, type checker and linter caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# --- Build output and packaging ---
+build/
+dist/
+*.spec
+*.manifest
+*.exe
+
+# --- Local secrets and environment files ---
+.env
+.env.*
+!.env.example
+
+# --- Qt / PySide6 generated files ---
+*.qmlc
+*.jsc
+.pyside6_cache/
+
+# --- Editor, IDE and OS temporary files ---
+.idea/
+*.swp
+*.swo
+*~
+*.tmp
+*.log
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# --- Local databases and state (added by later phases) ---
+*.db
+*.db-journal
+*.sqlite3
